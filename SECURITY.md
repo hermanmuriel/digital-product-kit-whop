@@ -4,11 +4,11 @@ This guide covers every part of the setup: your accounts, your keys, the server,
 
 ## The short version
 
-- [ ] Turn on two-factor login (an authenticator app or passkey, not text messages) for your **email**, **Stripe**, **GoDaddy**, **Resend**, **DigitalOcean** and **GitHub**.
+- [ ] Turn on two-factor login (an authenticator app or passkey, not text messages) for your **email**, **Whop**, **GoDaddy**, **Resend**, **DigitalOcean** and **GitHub**.
 - [ ] Use a password manager and a different password for every account.
 - [ ] Run `sudo ./harden.sh` on a fresh server before `./install.sh`.
 - [ ] Never put API keys in `.env`, in a chat, in a screenshot or in a message. The kit asks for them when it needs them and forgets them straight after.
-- [ ] After setup, delete the GoDaddy token (or give it a short expiry) and the full-access Resend key. The shop keeps working without them.
+- [ ] After setup, delete the Whop API key, the GoDaddy token (or give it a short expiry) and the full-access Resend key. The shop keeps working without them.
 - [ ] Back up the `data` folder.
 - [ ] If anything looks wrong, follow "If something goes wrong" at the bottom, in order.
 
@@ -20,7 +20,7 @@ Attackers mostly aren't after your ebook money. They're after what your accounts
 
 - **Your domain.** With your DNS they can send your buyers to their own checkout, or send emails "from you" to your customers.
 - **Your email sending.** Your domain has a good reputation, so phishing sent through it lands in inboxes.
-- **Your Stripe account.** They can use it to test stolen cards, or add their own webhook to see your sales and customer emails.
+- **Your Whop account.** They can use it to test stolen cards, change where your payouts go, or add their own webhook to see your sales and customer emails.
 - **Your server.** It gets used to attack others, or they copy your data and ask for money to give it back ("pay or we publish it").
 
 Bots scan the whole internet for open servers all day. A new server usually gets its first login attempts within minutes. Assume you'll be found, and make sure there's nothing easy to take.
@@ -32,7 +32,7 @@ Your email account is the master key, because every other account can be reset t
 | Account | What to turn on |
 | --- | --- |
 | **Email** (the one on all your accounts) | Two-factor with an app or passkey. Check the recovery phone and email are yours. Look at "recent devices" and log out anything you don't recognise. |
-| **Stripe** | Two-factor. If anyone else helps you, give them their own login with the smallest role, never your password. |
+| **Whop** | Two-factor. Check your payout method is yours. If anyone else helps you, give them their own login with the smallest role, never your password. |
 | **GoDaddy** | Two-factor. Keep **Domain Lock** on (it stops the domain being moved to another company). Keep a card on file only if you want the kit to buy domains. |
 | **Resend** | Two-factor. |
 | **DigitalOcean** | Two-factor. This account can see and control your whole server. |
@@ -49,12 +49,12 @@ A key is a password for a program. Anyone holding one can do whatever that key i
 
 | Stored in `data/` | What it can do if stolen | How bad |
 | --- | --- | --- |
-| Stripe webhook secret | Only check that a message came from Stripe. It can't read, charge, refund or move anything. | Low. Could be used to fake a purchase message to your own server and get a free download. |
+| Whop webhook secret | Only check that a message came from Whop. It can't read, charge, refund or move anything. | Low. Could be used to fake a purchase message to your own server and get a free download. |
 | Resend send-only key | Send email from `orders@yourdomain.com` only. It can't read your emails, see other domains or change settings. | Medium. Could send fake emails from your domain until you delete it. |
 
 The `data` folder can only be opened by the `shop` user. The shop service itself runs locked down: it can't change system files, can only write to `data`, and can only be reached through nginx.
 
-**The kit keeps no Stripe API key on the server at all.** The Buy button is a Stripe Payment Link made during setup, so the running shop never needs to talk to Stripe.
+**The kit keeps no Whop API key on the server at all.** The Buy button is a Whop checkout link made during setup, so the running shop never needs to talk to Whop.
 
 ### The keys you type in during setup
 
@@ -62,7 +62,7 @@ The `data` folder can only be opened by the `shop` user. The shop service itself
 
 | Key | What it can do | How to make it safer |
 | --- | --- | --- |
-| **Stripe secret key** | Almost everything in your Stripe account: products, refunds, customer details, webhooks. | Make a **restricted key** instead at [dashboard.stripe.com/apikeys](https://dashboard.stripe.com/apikeys) with only these set to **Write**: Products, Prices, Payment Links, Webhook Endpoints. Everything else set to None. The kit accepts it the same way. |
+| **Whop API key** | With the Admin role, almost everything in your Whop business: products, prices, refunds, customer details, webhooks. | Delete it in Whop (Dashboard, then Developer) after setup, and make a new one next time you run the command. The shop keeps working without it. The kit needs Admin so that Whop's payment messages include the buyer's email. |
 | **Resend full-access key** | Everything in Resend, including adding domains and making keys. | Delete it at [resend.com/api-keys](https://resend.com/api-keys) after setup, and make a new one next time you add a product. The send-only key the kit made keeps working. |
 | **GoDaddy token** | Change DNS on every domain you own, and **buy domains with your card**. | Give it the shortest expiry GoDaddy offers, or delete it after setup. It's only needed while `new_product.py` runs. |
 | **Cloudflare token** | Change DNS. | Limit it to the one zone (domain) you're using, and give it an expiry. |
@@ -138,18 +138,18 @@ Or turn on DigitalOcean's automatic backups for the Droplet (a small monthly fee
 
 What the kit already does:
 
-- **Payments can't be faked.** Every "payment done" message from Stripe is checked against the webhook secret. Anything else is rejected.
-- **A file is only sent once the money has actually arrived**, including slow bank payments.
+- **Payments can't be faked.** Every "payment done" message from Whop is checked against the webhook secret. Anything else is rejected.
+- **A file is only sent once Whop says the payment succeeded**, never because someone landed on the thank-you page.
 - **Download links are long random codes** that can't be guessed, and they stop working after a year.
 - **Your files aren't on the public website.** Only the download links can fetch them.
 - **Requests are rate limited** to 10 a second per visitor, so nobody can hammer the downloads or the webhook.
 - **The pages send security headers:** HTTPS only, no embedding in other sites, and scripts only from your own domain.
-- **No Stripe key on the server**, and email keys that can only send from one domain.
+- **No Whop key on the server**, and email keys that can only send from one domain.
 
 Things to know:
 
 - **A buyer can share their download link.** It works for anyone who has it until it expires. For expensive products, shorten the expiry by changing `expiry_days` in `data/kit.db`, or ask the kit's issues page for a per-product setting.
-- **Card testing.** Criminals sometimes use public checkout pages to test stolen cards with small purchases. Stripe Radar (on by default) blocks most of it. If you see lots of failed payments in Stripe, turn on stricter Radar rules or raise your price floor.
+- **Card testing.** Criminals sometimes use public checkout pages to test stolen cards with small purchases. Whop's own fraud checks block most of it. If you see lots of failed payments in Whop, look at its payment rules (they can block risky checkouts or require 3D Secure) or raise your price floor.
 - **Chargebacks.** Keep a clear refund policy on your page. A refund costs you less than a $15 chargeback fee. The download count on each order is proof the buyer got the file.
 
 ## 5. Using Claude or another AI on your server
@@ -174,25 +174,25 @@ The kit stores each buyer's email address and what they bought. That's personal 
   sqlite3 ~/digital-product-kit/data/kit.db "DELETE FROM orders WHERE email = 'them@example.com'"
   ```
 
-  Delete them in Stripe too (Customers).
+  Remove them in Whop too (Dashboard, then Users).
 - Don't copy the order list into other tools unless you need to, and never email it around.
 
 ## 7. If something goes wrong
 
 Signs to look out for:
 
-- emails from Stripe, GoDaddy or Resend about changes you didn't make
+- emails from Whop, GoDaddy or Resend about changes you didn't make
 - a domain that suddenly shows a different page
-- a webhook you don't recognise in Stripe
+- a webhook you don't recognise in Whop
 - emails in Resend's log you didn't send
 - a message asking for money
 
 Work through this **in order**:
 
 1. **Your email account first.** Change its password, check two-factor is on, and log out all other sessions.
-2. **Delete every key.** Stripe (API keys and restricted keys), Resend (all API keys), GoDaddy (tokens), Cloudflare (tokens). Make new ones later.
+2. **Delete every key.** Whop (API keys, live and sandbox), Resend (all API keys), GoDaddy (tokens), Cloudflare (tokens). Make new ones later.
 3. **Check your domain.** At GoDaddy, make sure the DNS records point to your server's IP and nothing was added. Make sure Domain Lock is still on.
-4. **Check Stripe.** Look at Developers, then Webhooks, and delete any endpoint you didn't make. Check your payout bank account is still yours, and check Team for unknown users.
+4. **Check Whop.** Look at Developer, then Webhooks, and delete any webhook you didn't make. Check your payout method is still yours, and check your team for unknown users.
 5. **Check Resend** for emails you didn't send.
 6. **Rebuild the server instead of cleaning it.** Make a new Droplet, run `harden.sh` and `install.sh`, restore `data` from your backup, run `new_product.py` again with your new keys, then destroy the old Droplet. You can't trust a server that someone else got into.
 7. **If buyer data was taken**, tell your buyers what happened. Depending on where you and they live, you may also have to tell your data protection authority (in the UK and EU, within 72 hours).

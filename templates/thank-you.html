@@ -24,15 +24,23 @@
 </main>
 <script>
 (function () {
-  var sid = new URLSearchParams(location.search).get("session_id");
+  var q = new URLSearchParams(location.search);
+  var pay = q.get("payment") || q.get("payment_id") || q.get("receipt_id");
+  var status = q.get("status");
   var tries = 0;
+  if (status === "failed" || status === "canceled") {
+    document.querySelector("h1").textContent = "Payment didn't go through";
+    document.getElementById("status").innerHTML =
+      'You haven\u2019t been charged. <a href="/">Go back and try again</a>.';
+    return;
+  }
   function check() {
-    if (!sid || tries++ > 40) {
+    if (!pay || tries++ > 40) {
       document.getElementById("status").textContent =
         "Your download link is on its way to your inbox. Questions? {{SUPPORT_EMAIL}}";
       return;
     }
-    fetch("/order-link?session_id=" + encodeURIComponent(sid))
+    fetch("/order-link?payment=" + encodeURIComponent(pay))
       .then(function (r) { return r.json(); })
       .then(function (d) {
         if (!d.ready) return setTimeout(check, 1500);

@@ -1,16 +1,17 @@
 """The small web service that sits behind every product domain.
 
-  POST /webhook                  Stripe says "paid" -> save the order, email the link
-  GET  /order-link?session_id=   thank-you page asks for the buyer's download link
+  POST /webhook                  Whop says "payment succeeded" -> save the order, email the link
+  GET  /order-link?payment=      thank-you page asks for the buyer's download link
   GET  /downloads/<token>        the buyer's download page
   GET  /downloads/<token>/<n>    one file
   GET  /health                   {"ok": true}
 
 nginx serves the sales page itself and forwards these paths here. The Buy button is a
-Stripe Payment Link, so this service holds no Stripe key at all: only the webhook
-secret, which can do nothing except check that a message really came from Stripe.
+Whop checkout link, so this service holds no Whop key at all: only the webhook
+secret, which can do nothing except check that a message really came from Whop.
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -22,102 +23,134 @@ from html import escape
 
 from flask import Flask, abort, request, send_from_directory
 
-from kit.common import ENV, FILES_DIR, db, get_setting, http
+from kit.common import ENV, FILES_DIR, db, get_setting
+from kit.orders import PAYMENT_ID, send_order_email
 
 app = Flask(__name__)
 
+TIMESTAMP = re.compile(r"[0-9]{1,12}")
+# Files go out only for these. Anything else (authorized, pending, unresolved...) waits.
+PAID = {"paid", "succeeded"}
 
-def signature_ok(payload, header, secret):
-    """Stripe's v1 webhook signature: HMAC-SHA256 of "<t>.<body>"."""
-    if not header or not secret:
+
+def signature_ok(payload, headers, secret):
+    """Whop signs with Standard Webhooks: base64 HMAC-SHA256 of "<id>.<timestamp>.<body>",
+    keyed with the literal bytes of the ws_... secret, prefix included."""
+    msg_id = headers.get("webhook-id")
+    timestamp = headers.get("webhook-timestamp") or ""
+    header = headers.get("webhook-signature")
+    if not secret or not msg_id or not header:
         return False
-    parts = [p.split("=", 1) for p in header.split(",") if "=" in p]
-    timestamp = next((v for k, v in parts if k == "t"), None)
-    sigs = [v for k, v in parts if k == "v1"]
-    if not timestamp or not timestamp.isdigit() or abs(time.time() - int(timestamp)) > 300:
+    if not TIMESTAMP.fullmatch(timestamp) or abs(time.time() - int(timestamp)) > 300:
         return False
-    expected = hmac.new(secret.encode(), f"{timestamp}.".encode() + payload,
-                        hashlib.sha256).hexdigest()
-    return any(hmac.compare_digest(expected, s) for s in sigs)
+    signed = f"{msg_id}.{timestamp}.".encode() + payload
+    expected = base64.b64encode(hmac.new(secret.encode(), signed, hashlib.sha256).digest())
+    # The header can hold several signatures ("v1,abc v1,def") while a secret rotates.
+    sigs = [part[3:] for part in header.split() if part.startswith("v1,")]
+    return any(hmac.compare_digest(expected, s.encode()) for s in sigs)
 
 
-def send_order_email(product, email, token):
-    link = f"https://{product['domain']}/downloads/{token}"
-    # A Resend key that can only send, and only from this product's domain.
+def buyer_email(payment):
+    # Newer API versions put it at the top; older ones inside "user".
+    user = payment.get("user") if isinstance(payment.get("user"), dict) else {}
+    return payment.get("customer_email") or user.get("email") or ""
+
+
+def plan_id(payment):
+    plan = payment.get("plan") if isinstance(payment.get("plan"), dict) else {}
+    return payment.get("plan_id") or plan.get("id")
+
+
+def signed_by(payload, headers):
+    """Which Whop (live or sandbox) signed this message, or None if neither did."""
     with db() as conn:
-        key = get_setting(conn, f"resend_send_key:{product['domain']}")
-    http("POST", "https://api.resend.com/emails",
-         headers={"Authorization": f"Bearer {key}"},
-         json_body={
-             "from": f"{product['seller_name']} <orders@{product['domain']}>",
-             "to": [email],
-             "reply_to": ENV["SUPPORT_EMAIL"],
-             "subject": f"Your copy of {product['title']} is ready",
-             "text": (
-                 f"Hi,\n\nThank you for your order. Your copy of {product['title']} "
-                 f"is ready.\n\nDownload it here:\n{link}\n\n"
-                 f"That link is yours, so save the files somewhere safe once you "
-                 f"have them.\n\nIf anything doesn't work, just reply to this email.\n\n"
-                 f"{product['seller_name']}"
-             ),
-         })
+        for mode in ("live", "sandbox"):
+            if signature_ok(payload, headers, get_setting(conn, f"whop_webhook_secret_{mode}")):
+                return mode
+    return None
+
+
+def product_for(conn, payment, mode):
+    """The product this payment bought, but only if the product is currently sold in
+    the same mode. After going live, a sandbox (test card) payment unlocks nothing."""
+    meta = payment.get("metadata") if isinstance(payment.get("metadata"), dict) else {}
+    if meta.get("product_slug"):
+        row = conn.execute("SELECT * FROM products WHERE slug = ? AND mode = ?",
+                           (meta["product_slug"], mode)).fetchone()
+        if row:
+            return row
+    # Backup: the variant id, for a sale made from the product's page on whop.com.
+    return conn.execute(
+        "SELECT p.* FROM plans v JOIN products p ON p.slug = v.slug "
+        "WHERE v.plan_id = ? AND v.mode = ? AND p.mode = ?",
+        (plan_id(payment), mode, mode)).fetchone()
 
 
 @app.post("/webhook")
 def webhook():
     payload = request.get_data()
-    with db() as conn:
-        secrets = [get_setting(conn, f"webhook_secret_{m}") for m in ("test", "live")]
-    header = request.headers.get("Stripe-Signature")
-    if not any(signature_ok(payload, header, s) for s in secrets):
+    mode = signed_by(payload, request.headers)
+    if not mode:
         abort(400)
-    event = json.loads(payload)
-    if event.get("type") not in ("checkout.session.completed",
-                                 "checkout.session.async_payment_succeeded"):
-        return {"received": True}
-
-    session = event["data"]["object"]
-    # Bank payments can "complete" before the money arrives. Deliver only once it's paid;
-    # Stripe sends async_payment_succeeded when a delayed payment clears.
-    if session.get("payment_status") != "paid":
-        return {"received": True, "waiting_for_payment": True}
-    slug = (session.get("metadata") or {}).get("product_slug")
-    email = (session.get("customer_details") or {}).get("email")
-    with db() as conn:
-        product = conn.execute("SELECT * FROM products WHERE slug = ?", (slug,)).fetchone()
-        # Payments for anything this kit didn't sell: acknowledge and ignore.
-        if not product or not email:
-            return {"received": True, "ignored": True}
-        token = str(uuid.uuid4())
-        cur = conn.execute(
-            "INSERT INTO orders (token, email, slug, session_id) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(session_id) DO NOTHING", (token, email, slug, session["id"]))
-        if cur.rowcount == 0:
-            return {"received": True, "duplicate": True}
-
     try:
-        send_order_email(product, email, token)
+        event = json.loads(payload)
+    except ValueError:
+        abort(400)
+    if not isinstance(event, dict) or event.get("type") != "payment.succeeded":
+        return {"received": True}
+    payment = event.get("data") if isinstance(event.get("data"), dict) else {}
+    pay_id = str(payment.get("id") or "")
+
+    with db() as conn:
+        product = product_for(conn, payment, mode)
+        # Payments for anything this kit isn't selling (in this mode): acknowledge, ignore.
+        if not product or not PAYMENT_ID.fullmatch(pay_id):
+            return {"received": True, "ignored": True}
+        if payment.get("status") not in PAID:
+            app.logger.warning("payment %s has status %r, not sending files", pay_id,
+                               payment.get("status"))
+            return {"received": True, "not_paid": True}
+        email = buyer_email(payment)
+        conn.execute(
+            "INSERT INTO orders (token, email, slug, session_id, emailed) "
+            "VALUES (?, ?, ?, ?, 0) ON CONFLICT(session_id) DO NOTHING",
+            (str(uuid.uuid4()), email, product["slug"], pay_id))
+        if email:
+            conn.execute("UPDATE orders SET email = ? WHERE session_id = ? AND email = ''",
+                         (email, pay_id))
+        order = conn.execute("SELECT * FROM orders WHERE session_id = ?", (pay_id,)).fetchone()
+
+    if order["emailed"]:
+        return {"received": True, "duplicate": True}
+    if not order["email"]:
+        # The order is saved (the thank-you page still shows the download), but there's
+        # no address to email. The seller finds it in Whop and sends it by hand.
+        app.logger.error("payment %s has no buyer email. Find it in Whop under Payments, "
+                         "then run: ./send_order.py %s their@email.com", pay_id, pay_id)
+        return {"received": True, "needs_email": True}
+    try:
+        send_order_email(product, order["email"], order["token"])
     except Exception:
-        # The email is the product. Drop the order so Stripe's retry sends it again.
-        app.logger.exception("order email failed for %s", session["id"])
-        with db() as conn:
-            conn.execute("DELETE FROM orders WHERE session_id = ?", (session["id"],))
+        # The email is the product. The order stays unsent, so Whop's retry sends it.
+        app.logger.exception("order email failed for %s", pay_id)
         abort(500)
+    with db() as conn:
+        conn.execute("UPDATE orders SET emailed = 1 WHERE session_id = ?", (pay_id,))
     return {"received": True}
 
 
 @app.get("/order-link")
 def order_link():
-    """Lets the thank-you page show the download link straight away. Session ids
-    are long and unguessable, and only orders from the last day are answered."""
-    sid = request.args.get("session_id", "")
-    if not re.fullmatch(r"cs_(live|test)_[A-Za-z0-9]{10,200}", sid):
+    """Lets the thank-you page show the download link straight away. Payment ids
+    are long and random, and only orders from the last day are answered."""
+    pay_id = request.args.get("payment", "")
+    if not PAYMENT_ID.fullmatch(pay_id):
         return {"ready": False}, 400
     with db() as conn:
         row = conn.execute(
             "SELECT o.token, p.domain FROM orders o JOIN products p ON p.slug = o.slug "
             "WHERE o.session_id = ? AND o.created_at > datetime('now', '-1 day')",
-            (sid,)).fetchone()
+            (pay_id,)).fetchone()
     if not row:
         return {"ready": False}
     return {"ready": True, "url": f"https://{row['domain']}/downloads/{row['token']}"}

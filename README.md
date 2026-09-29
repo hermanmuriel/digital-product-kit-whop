@@ -1,8 +1,8 @@
-# Digital Product Kit
+# Digital Product Kit (Whop edition)
 
-Sell an ebook, a template pack or any file on your own website, with your own Stripe account. One command buys the domain, builds the sales page, sets up checkout and emails every buyer their download.
+Sell an ebook, a template pack or any file on your own website, with Whop taking the payments. One command buys the domain, builds the sales page, sets up checkout and emails every buyer their download.
 
-No Gumroad cut, no monthly platform fee, and nothing to do by hand after a sale.
+This is a version of [Digital Product Kit](https://github.com/samalgrow/digital-product-kit) by Algrow that uses **Whop instead of Stripe**. Whop accepts sellers and pays out in far more countries than Stripe does, and shows buyers local payment methods at checkout.
 
 ```
 ./new_product.py --name "The Houseplant Handbook" --price 19 --file handbook.pdf \
@@ -12,13 +12,13 @@ No Gumroad cut, no monthly platform fee, and nothing to do by hand after a sale.
 **What that one command does**
 
 1. Buys `houseplanthandbook.com` at GoDaddy (it asks you first and tells you the price)
-2. Creates the product in your Stripe account
+2. Creates the product, the price and a checkout link in your Whop account
 3. Points the domain at your server
 4. Sets up order emails from `orders@houseplanthandbook.com`
 5. Puts a sales page and a thank-you page on the domain
 6. Turns on HTTPS (the padlock in the browser)
 
-When someone buys, they land on a thank-you page with a download button, and they get an email with their private download link.
+When someone buys, they pay on Whop's checkout page, come back to your thank-you page with a download button, and get an email with their private download link.
 
 **What it costs you**
 
@@ -26,9 +26,15 @@ When someone buys, they land on a thank-you page with a download button, and the
 | --- | --- |
 | Server (DigitalOcean) | $6 a month |
 | Domain (GoDaddy) | about $10 for the first year |
-| Stripe | Stripe's normal fee on each sale, nothing else |
+| Whop | Whop's fee on each sale, plus a small fee when you withdraw. See [docs.whop.com/fees](https://docs.whop.com/fees) |
 | Order emails (Resend) | Free for 1 domain and up to 100 emails a day |
 | This kit | Free |
+
+---
+
+## Before you start: check Whop can pay you
+
+Sign up at [whop.com](https://whop.com), open your dashboard, and go to setting up payouts. Make sure your own bank account (or wallet) shows up as a way to get paid in your country. It takes 10 minutes and costs nothing. If it isn't offered, stop here: the rest won't help you get paid.
 
 ---
 
@@ -38,7 +44,7 @@ Copy this whole box into Claude, ChatGPT or any AI assistant. Fill in the three 
 
 ```text
 I want to sell a digital product (like an ebook) on my own website using
-Digital Product Kit: https://github.com/samalgrow/digital-product-kit
+Digital Product Kit, Whop edition: https://github.com/Koudelkalarrain/digital-product-kit-whop
 
 Read that repo's README first, then walk me through setting it up. I am not
 technical, so please follow these rules:
@@ -50,8 +56,8 @@ technical, so please follow these rules:
    so I will run that command and type the keys in myself.
 3. Before anything that costs money (the server, buying the domain, turning on
    live payments), tell me the price and wait for my OK.
-4. Start in Stripe test mode. Only switch to real payments after I have done a
-   test purchase that worked, start to finish.
+4. Start with Whop's sandbox (--sandbox). Only switch to real payments after I
+   have done a test purchase that worked, start to finish.
 5. If something fails, ask me to paste the error message (never a key), then
    use the README's "If something goes wrong" section.
 6. Follow SECURITY.md in the repo. Don't turn off the firewall, fail2ban or
@@ -71,7 +77,7 @@ Domain I want (or "help me pick one"):
 
 This takes about 30 minutes. You don't need to know how to code. You will copy and paste a few commands.
 
-You'll make 4 accounts along the way: **DigitalOcean** (the server), **GoDaddy** (the domain), **Stripe** (the payments) and **Resend** (the order emails).
+You'll make 4 accounts along the way: **DigitalOcean** (the server), **GoDaddy** (the domain), **Whop** (the payments) and **Resend** (the order emails).
 
 ### Step 1: Get a server on DigitalOcean
 
@@ -111,7 +117,7 @@ From now on you're working as `shop`.
 ### Step 3: Lock the server down and install the kit
 
 ```
-git clone https://github.com/samalgrow/digital-product-kit.git
+git clone https://github.com/Koudelkalarrain/digital-product-kit-whop.git digital-product-kit
 cd digital-product-kit
 sudo ./harden.sh
 ```
@@ -139,9 +145,11 @@ Keys are like passwords that let the kit use your accounts. **You don't save the
 
 | Key | Where to get it |
 | --- | --- |
-| **Stripe** | Sign up at [stripe.com](https://stripe.com). Open [dashboard.stripe.com/test/apikeys](https://dashboard.stripe.com/test/apikeys) and copy the **Secret key**. It starts with `sk_test_`. That's test mode: no real money moves. (Safer: a restricted key, see [SECURITY.md](SECURITY.md).) |
+| **Whop sandbox** (for testing) | Whop's sandbox is a separate practice copy of Whop where no real money moves. Sign up at [sandbox.whop.com](https://sandbox.whop.com) (a separate account from your real one), create a business, then open [sandbox.whop.com/dashboard/developer](https://sandbox.whop.com/dashboard/developer). Under **Account API Keys** click **Create**, give it the **Admin** role, and copy the key. |
 | **Resend** | Sign up at [resend.com](https://resend.com). Go to **API Keys**, click **Create API Key**, and pick **Full access**. It starts with `re_`. |
 | **GoDaddy** | Sign in at [godaddy.com](https://www.godaddy.com) and make sure a card is saved on your account (that's how the domain gets paid for). Then open [developer.godaddy.com/personal-access-token](https://developer.godaddy.com/personal-access-token) and create a token that can manage domains and DNS and register domains. Give it a short expiry. |
+
+You'll get the real Whop key in Step 8, once the test works.
 
 Already have your domain on **Cloudflare** instead? Make a token at [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) with the "Edit zone DNS" template and use that instead of GoDaddy. The kit can't buy domains through Cloudflare, only use ones you already have there.
 
@@ -167,34 +175,35 @@ scp handbook.pdf shop@YOUR_SERVER_IP:~/digital-product-kit/
 `YOUR_SERVER_IP` is the number on your Droplet's page, like `164.90.12.34`. This needs an SSH key, because `harden.sh` switched off password logins. [SECURITY.md](SECURITY.md) shows how to add one in 2 minutes.
 </details>
 
-### Step 6: Run the command
+### Step 6: Run the command (sandbox first)
 
-Change the words in quotes to your own, then paste it:
+Change the words in quotes to your own, then paste it. The `--sandbox` at the end means test mode: nothing is charged.
 
 ```
 ./new_product.py --name "The Houseplant Handbook" --price 19 \
     --file handbook.pdf --cover cover.jpg \
     --domain houseplanthandbook.com --seller "Maya Green" \
     --description "Keep every plant in your home alive, even if you've killed a cactus." \
-    --buy
+    --buy --sandbox
 ```
 
 | Part | What it means |
 | --- | --- |
 | `--name` | The product's title |
-| `--price` | The price, like `19` or `19.99` |
+| `--price` | The price, like `19` or `19.99` (at least 1) |
 | `--file` | The file buyers get. Use `--file` again to give them more than one. |
 | `--cover` | A cover image for the sales page (optional) |
 | `--domain` | The website address. One product per domain. |
 | `--seller` | Your name. It shows on the page and in the order email. |
 | `--description` | A line or two under the title (optional) |
 | `--buy` | Buy the domain if you don't own it yet |
-| `--currency` | `usd` unless you add this, e.g. `--currency gbp` |
+| `--sandbox` | Use Whop's sandbox: test cards, no real money |
+| `--currency` | `usd` unless you add this, e.g. `--currency eur` |
 
 First it asks for your keys, one at a time. Paste each one (right-click, or Ctrl+Shift+V) and press Enter. Nothing shows on screen while you paste, which is on purpose.
 
 ```
-  Stripe secret key (sk_...):
+  Whop SANDBOX API key:
   Resend API key, full access (re_...):
   GoDaddy token (or press Enter to use Cloudflare):
 ```
@@ -209,12 +218,12 @@ If the domain isn't yours yet, it shows the price and asks before buying:
   Buy it with the card on your GoDaddy account? [y/N]
 ```
 
-Type `y` and press Enter to buy it. This is a real purchase, even while Stripe is in test mode. Anything else stops without buying. If the name is taken, it stops and charges nothing.
+Type `y` and press Enter to buy it. **This is a real purchase, even in sandbox mode.** Anything else stops without buying. If the name is taken, it stops and charges nothing.
 
 Then it works through the rest by itself. It finishes with:
 
 ```
-Live: https://houseplanthandbook.com  (TEST mode, pay with 4242 4242 4242 4242)
+Live: https://houseplanthandbook.com  (SANDBOX, pay with 4242 4242 4242 4242)
 Your keys were not saved on this server.
 ```
 
@@ -222,19 +231,20 @@ A brand new domain can take a few minutes to start working everywhere. If a step
 
 ### Step 7: Test it
 
-1. Open your domain in your browser and click **Buy now**.
-2. Pay with the test card `4242 4242 4242 4242`, any future date, any 3 numbers for the CVC, and **your own email**.
+1. Open your domain in your browser and click **Buy now**. You go to Whop's sandbox checkout.
+2. Pay with the test card `4242 4242 4242 4242`, any future date, any 3 numbers for the CVC, and **your own email**. (The sandbox only takes cards. Real checkout also shows local payment methods.)
 3. Check that you land on the thank-you page, the download works, and the email arrives (look in spam the first time).
 
-No real money moves in test mode.
+No real money moves in the sandbox.
 
 ### Step 8: Start taking real money
 
-1. In Stripe, finish setting up your account (business details and a bank account for payouts).
-2. Turn off test mode and copy your live **Secret key** from [dashboard.stripe.com/apikeys](https://dashboard.stripe.com/apikeys). It starts with `sk_live_`.
-3. Run your Step 6 command again (you can leave off `--buy`) and paste the `sk_live_` key when it asks for the Stripe key.
-4. Buy your own product once with a real card, then refund yourself in Stripe.
-5. Go through the checklist at the top of [SECURITY.md](SECURITY.md). It takes 10 minutes.
+1. In your **real** Whop account ([whop.com](https://whop.com)), finish setting up your business and payouts.
+2. Open **Dashboard, then Developer**. Under **Account API Keys** click **Create**, give it the **Admin** role, and copy the key. (Sandbox keys and real keys look the same, so name them clearly in your password manager.)
+3. Run your Step 6 command again **without `--sandbox`** (you can leave off `--buy` too). Paste the real Whop key when it asks. It swaps the Buy button to your real checkout. From then on, test-card payments from the sandbox can't unlock anything on this domain.
+4. Buy your own product once with a real card, then refund yourself in Whop (Dashboard, then Payments).
+5. Delete the Whop API key in Whop once it's done. The shop keeps working without it.
+6. Go through the checklist at the top of [SECURITY.md](SECURITY.md). It takes 10 minutes.
 
 That's it. You're selling.
 
@@ -242,13 +252,15 @@ That's it. You're selling.
 
 ## Everyday things
 
-**Change the price, text, cover or files:** run your Step 6 command again with the new values. It updates what's there and never makes duplicates.
+**Change the price, text, cover or files:** run your Step 6 command again with the new values (without `--sandbox` once you're live). It updates what's there and never makes duplicates. A new price gets a new checkout link, and the old price is archived in Whop.
 
 **Add another product:** run the command again with a new `--name` and a new `--domain`. The free Resend plan covers 1 domain, so a second product needs Resend's paid plan.
 
 **Make the page look different:** the sales page is `templates/index.html`, one plain HTML file. Edit it, then run your Step 6 command again.
 
-**See your sales:** in your Stripe dashboard, like any other Stripe payment.
+**See your sales:** in your Whop dashboard, under Payments.
+
+**Re-send a buyer's download email:** find the payment id (`pay_...`) in Whop under Payments, then run `./send_order.py pay_... their@email.com`.
 
 **Update the kit:** `cd ~/digital-product-kit && git pull && ./install.sh`
 
@@ -261,12 +273,16 @@ That's it. You're selling.
 | `... is not in your GoDaddy account` | Add `--buy` to the command, or check you typed the domain right. |
 | `... is taken` | Someone owns that domain. Pick another name. |
 | `Set SUPPORT_EMAIL in .env first` | Run `nano .env`, put your email after `SUPPORT_EMAIL=`, save with Ctrl+O, Enter, Ctrl+X. |
-| `Remove these from .env` | You have keys saved in `.env` from an older version. Delete those lines with `nano .env`. The command asks for keys instead. |
+| `Remove these from .env` | You have keys saved in `.env`. Delete those lines with `nano .env`. The command asks for keys instead. |
 | `That doesn't look like a ...` | The key you pasted is incomplete or the wrong one. Copy it again. |
+| `Whop didn't accept that key` | Copy the whole key again and check it has the **Admin** role. A sandbox key only works with `--sandbox`, and a real key only without it. |
+| `Whop's lowest price is 1.00` | Whop doesn't sell below 1 in any currency. Raise `--price`. |
 | `certbot failed` | The new domain hasn't spread yet. Wait 10 to 30 minutes and run the command again. |
-| `HTTP 401` or `HTTP 403` | A key is wrong or missing a permission. Make a new one and run the command again. |
+| `HTTP 401` or `HTTP 403` from Resend or GoDaddy | That key is wrong or missing a permission. Make a new one and run the command again. |
 | `Resend is still checking the records` | Normal for a new domain. Emails start once it says Verified at [resend.com/domains](https://resend.com/domains), usually within an hour. |
-| Paid, but no download shows up | Look at the last lines of the service log: `sudo journalctl -u digital-product-kit -n 30` |
+| Paid, but no download shows up | Look at the last lines of the service log: `sudo journalctl -u digital-product-kit -n 30`. In Whop, open Developer, then Webhooks, to see each message Whop sent your server and resend a failed one. |
+| Log says `has no buyer email` | The order is saved, and the buyer's thank-you page still showed the download. Find their email in Whop under Payments, then run the command the log line shows: `./send_order.py pay_... their@email.com`. |
+| `... already takes real payments` | You added `--sandbox` to a shop that's live. Leave it off. To test changes safely, use a second domain. |
 | Can't log in over SSH any more | That's `harden.sh` switching off password logins. Use the **Console** button on DigitalOcean, or add an SSH key ([SECURITY.md](SECURITY.md)). |
 | The email never arrives | Check spam, and check [resend.com/emails](https://resend.com/emails) to see if it was sent. |
 
@@ -278,9 +294,9 @@ Read [SECURITY.md](SECURITY.md). It covers your accounts, every key, the server,
 
 The short version of what the kit does:
 
-- **No powerful keys on the server.** Stripe, GoDaddy and full Resend keys are typed in during setup and never saved. The running shop holds no Stripe key at all, only a webhook secret and a Resend key that can only send email from your domain.
+- **No powerful keys on the server.** Whop, GoDaddy and full Resend keys are typed in during setup and never saved. The running shop holds no Whop key at all, only a webhook secret and a Resend key that can only send email from your domain.
 - **The server is locked down** by `harden.sh`: firewall, fail2ban, automatic security updates, no root login, no password logins.
-- **Payments can't be faked**, and a file is only sent once the money has actually arrived.
+- **Payments can't be faked.** Every "payment succeeded" message is checked against Whop's signature, and files are only sent when Whop says the payment went through.
 - **Download links are random and unguessable**, and your files aren't on the public website.
 - **Buyer emails and orders** sit in `data/`, which only `shop` can read.
 
@@ -288,14 +304,14 @@ The short version of what the kit does:
 
 ```
 buyer  ->  yourdomain.com         the sales page (nginx)
-       ->  Buy now                Stripe Payment Link (Stripe's own checkout page)
-       ->  paid                   Stripe tells your server, it saves the order
+       ->  Buy now                Whop checkout link (Whop's own checkout page)
+       ->  paid                   Whop tells your server, it saves the order
                                   and emails the download link (Resend)
        ->  thank-you page         shows the download button straight away
 ```
 
-The server only receives Stripe's "paid" message and hands out downloads. It's about 180 lines of Python in `kit/server.py`, plus `new_product.py`, which does the setup. Orders are kept in a small SQLite database in `data/kit.db`.
+The server only receives Whop's "payment succeeded" message and hands out downloads. It's about 200 lines of Python in `kit/server.py`, plus `new_product.py`, which does the setup. Orders are kept in a small SQLite database in `data/kit.db`.
 
 ---
 
-Built by the team at [Algrow](https://algrow.online), tools for YouTube creators. MIT licensed, so use it however you want.
+Based on [Digital Product Kit](https://github.com/samalgrow/digital-product-kit), built by the team at [Algrow](https://algrow.online). MIT licensed, so use it however you want.

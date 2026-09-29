@@ -1,6 +1,6 @@
 """Shared bits: settings from .env, a tiny HTTP helper, and the SQLite store.
 
-.env only holds harmless settings. Keys that can change anything (Stripe, GoDaddy,
+.env only holds harmless settings. Keys that can change anything (Whop, GoDaddy,
 full Resend) are typed in during setup and never saved."""
 
 import json
@@ -59,12 +59,24 @@ def http(method, url, headers=None, json_body=None, form=None, timeout=30):
     return json.loads(raw) if raw.strip() else {}
 
 
-def stripe(key, method, path, form=None):
-    url = "https://api.stripe.com" + path
-    if method == "GET" and form:
-        url += "?" + urllib.parse.urlencode(form)
-        form = None
-    return http(method, url, headers={"Authorization": f"Bearer {key}"}, form=form)
+# Whop versions its API by date. Pinning one keeps the replies (and the webhook
+# payloads) in the shape this code was written against.
+WHOP_API_VERSION = "2026-09-29"
+WHOP_HOSTS = {
+    "live": ("https://api.whop.com/api/v1", "https://whop.com"),
+    "sandbox": ("https://sandbox-api.whop.com/api/v1", "https://sandbox.whop.com"),
+}
+
+
+def whop(key, mode, method, path, body=None, query=None):
+    """One call to Whop's API. mode is "live" or "sandbox" (Whop's test copy)."""
+    url = WHOP_HOSTS[mode][0] + path
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    return http(method, url, json_body=body, headers={
+        "Authorization": f"Bearer {key}",
+        "Api-Version-Date": WHOP_API_VERSION,
+    })
 
 
 SCHEMA = """
@@ -73,7 +85,7 @@ CREATE TABLE IF NOT EXISTS products (
     title         TEXT NOT NULL,
     domain        TEXT NOT NULL,
     seller_name   TEXT NOT NULL,
-    price_id      TEXT NOT NULL,
+    price_id      TEXT NOT NULL,             -- the Whop variant (plan_...) buyers pay for
     files         TEXT NOT NULL,             -- JSON list of file names
     expiry_days   INTEGER NOT NULL DEFAULT 365,
     created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -83,7 +95,7 @@ CREATE TABLE IF NOT EXISTS orders (
     token          TEXT NOT NULL UNIQUE,
     email          TEXT NOT NULL,
     slug           TEXT NOT NULL,
-    session_id     TEXT NOT NULL UNIQUE,
+    session_id     TEXT NOT NULL UNIQUE,      -- the Whop payment id (pay_...)
     downloads      INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -91,7 +103,19 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS plans (           -- every Whop variant the kit made
+    plan_id  TEXT PRIMARY KEY,
+    slug     TEXT NOT NULL,
+    mode     TEXT NOT NULL                   -- "sandbox" or "live"
+);
 """
+
+# Columns added after the first release. Existing rows get the value that matches
+# how they were made: every older product was live, every older order was emailed.
+MIGRATIONS = {
+    "products": [("mode", "TEXT NOT NULL DEFAULT 'live'")],
+    "orders": [("emailed", "INTEGER NOT NULL DEFAULT 1")],
+}
 
 
 def db():
@@ -101,6 +125,11 @@ def db():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    for table, columns in MIGRATIONS.items():
+        have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, spec in columns:
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
     return conn
 
 

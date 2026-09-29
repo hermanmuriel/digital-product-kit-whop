@@ -6,16 +6,18 @@
 
 What it does:
   1. Buys the domain at GoDaddy if you don't own it yet (with --buy)
-  2. Creates the product and price in Stripe
+  2. Creates the product, price and checkout link in Whop
   3. Points the domain at this server (GoDaddy or Cloudflare DNS)
   4. Sets up order email from orders@<domain> with Resend
   5. Writes the sales page and thank-you page
   6. Configures nginx and gets an HTTPS certificate
 Safe to run again: it updates what exists instead of making duplicates.
 
-It asks for your Stripe, Resend and GoDaddy (or Cloudflare) keys each time and never
+Add --sandbox to try it with Whop's sandbox first: same flow, test cards, no real money.
+
+It asks for your Whop, Resend and GoDaddy (or Cloudflare) keys each time and never
 saves them. What stays on the server can't touch your money, your domain or your
-email account: a Stripe webhook secret and a Resend key that can only send email
+email account: a Whop webhook secret and a Resend key that can only send email
 from this one domain.
 """
 
@@ -32,7 +34,8 @@ from getpass import getpass
 from html import escape
 from pathlib import Path
 
-from kit.common import ENV, FILES_DIR, ROOT, HttpError, db, get_setting, http, set_setting, stripe
+from kit.common import (ENV, FILES_DIR, ROOT, WHOP_API_VERSION, WHOP_HOSTS, HttpError, db,
+                         get_setting, http, set_setting, whop)
 from kit.dns import provider_for
 
 PORT = ENV.get("PORT", "8750")
@@ -52,7 +55,7 @@ def sudo(*cmd, stdin=None):
                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
-SETUP_KEYS = ("STRIPE_SECRET_KEY", "RESEND_API_KEY", "GODADDY_TOKEN", "CLOUDFLARE_API_TOKEN")
+SETUP_KEYS = ("WHOP_API_KEY", "RESEND_API_KEY", "GODADDY_TOKEN", "CLOUDFLARE_API_TOKEN")
 
 
 def check_env():
@@ -75,65 +78,145 @@ def ask_key(name, label, prefixes=(), optional=False):
     return value
 
 
-# ------------------------------------------------------------------ Stripe
+# ------------------------------------------------------------------ Whop
 
 
-def stripe_product(key, args, slug, cents, domain):
-    """Product, price and the Payment Link behind the Buy button."""
-    found = stripe(key, "GET", "/v1/products/search",
-                   {"query": f"metadata['product_slug']:'{slug}'"})["data"]
-    if found:
-        product = stripe(key, "POST", f"/v1/products/{found[0]['id']}",
-                         {"name": args.name, "active": "true"})
-    else:
-        product = stripe(key, "POST", "/v1/products", {"name": args.name,
-                                                        "metadata[product_slug]": slug})
-    prices = stripe(key, "GET", "/v1/prices", {"product": product["id"], "active": "true"})["data"]
-    price = next((p for p in prices if p["unit_amount"] == cents
-                  and p["currency"] == args.currency), None)
-    if not price:
-        price = stripe(key, "POST", "/v1/prices", {"product": product["id"], "unit_amount": cents,
-                                                   "currency": args.currency})
+def whop_product(key, mode, args, slug, domain):
+    """Product, variant (the price) and the checkout link behind the Buy button.
 
-    # Reuse the link while the price and domain are the same, otherwise replace it.
-    meta = product.get("metadata", {})
-    link = None
-    if meta.get("payment_link_id"):
-        link = stripe(key, "GET", f"/v1/payment_links/{meta['payment_link_id']}")
-        lm = link.get("metadata", {})
-        if not link["active"] or lm.get("price_id") != price["id"] or lm.get("domain") != domain:
-            stripe(key, "POST", f"/v1/payment_links/{link['id']}", {"active": "false"})
-            link = None
-    if not link:
-        link = stripe(key, "POST", "/v1/payment_links", {
-            "line_items[0][price]": price["id"],
-            "line_items[0][quantity]": "1",
-            # Copied onto every checkout, so the webhook knows which product was bought.
-            "metadata[product_slug]": slug,
-            "metadata[price_id]": price["id"],
-            "metadata[domain]": domain,
-            "after_completion[type]": "redirect",
-            "after_completion[redirect][url]":
-                f"https://{domain}/thank-you.html?session_id={{CHECKOUT_SESSION_ID}}",
-            "allow_promotion_codes": "true",
+    Whop's ids are kept in the local database after each step, so running again (even
+    after a failure halfway) updates them instead of making duplicates. A new price
+    gets a new variant; a new variant or domain gets a new checkout link, and the old
+    link is deleted so it can't keep selling."""
+    setting = f"whop:{mode}:{slug}"
+    with db() as conn:
+        ids = json.loads(get_setting(conn, setting) or "{}")
+
+    def save(**changes):
+        ids.update(changes)
+        with db() as conn:
+            set_setting(conn, setting, json.dumps(ids))
+
+    meta = {"product_slug": slug}
+    product = None
+    if ids.get("product"):
+        try:
+            product = whop(key, mode, "PATCH", f"/products/{ids['product']}",
+                           {"title": args.name[:80]})
+        except HttpError as err:
+            if err.status != 404:
+                raise
+    if not product:
+        product = whop(key, mode, "POST", "/products",
+                       {"title": args.name[:80], "metadata": meta})
+        ids.clear()
+        save(product=product["id"])
+
+    plan = None
+    if ids.get("plan"):
+        try:
+            plan = whop(key, mode, "GET", f"/variants/{ids['plan']}")
+        except HttpError as err:
+            if err.status != 404:
+                raise
+        same = plan and plan.get("visibility") != "archived" \
+            and round(float(plan.get("initial_price") or 0), 2) == round(args.price, 2) \
+            and (plan.get("currency") or "").lower() == args.currency
+        if plan and not same:
+            # Remembered, so it still gets archived if this run stops halfway.
+            save(retire=plan["id"])
+            plan = None
+    if not plan:
+        plan = whop(key, mode, "POST", "/variants", {
+            "product_id": product["id"],
+            "plan_type": "one_time",
+            "initial_price": args.price,
+            "currency": args.currency,
+            "metadata": meta,  # Whop copies this onto every payment
         })
-        stripe(key, "POST", f"/v1/products/{product['id']}",
-               {"metadata[payment_link_id]": link["id"]})
-    return product["id"], price["id"], link["url"]
+        save(plan=plan["id"])
+    with db() as conn:
+        conn.execute("INSERT OR IGNORE INTO plans (plan_id, slug, mode) VALUES (?, ?, ?)",
+                     (plan["id"], slug, mode))
+
+    checkout = None
+    if ids.get("checkout") and ids.get("checkout_plan") == plan["id"] \
+            and ids.get("checkout_domain") == domain:
+        try:
+            checkout = whop(key, mode, "GET", f"/checkout_configurations/{ids['checkout']}")
+        except HttpError as err:
+            if err.status != 404:
+                raise
+    if not checkout:
+        old_checkout = ids.get("checkout")
+        checkout = whop(key, mode, "POST", "/checkout_configurations", {
+            "mode": "payment",
+            "plan_id": plan["id"],
+            # Whop adds ?payment=pay_...&status=... when it sends the buyer back.
+            "redirect_url": f"https://{domain}/thank-you.html",
+            # Copied onto every payment, so the webhook knows which product was bought.
+            "metadata": {**meta, "domain": domain},
+        })
+        save(checkout=checkout["id"], checkout_plan=plan["id"], checkout_domain=domain)
+        if old_checkout:
+            try:
+                whop(key, mode, "DELETE", f"/checkout_configurations/{old_checkout}")
+            except HttpError as err:
+                if err.status != 404:
+                    raise
+    if ids.get("retire") and ids["retire"] != plan["id"]:
+        # Old price: stop selling it, now that the new one is on sale. Past buyers
+        # keep their downloads.
+        try:
+            whop(key, mode, "PATCH", f"/variants/{ids['retire']}", {"visibility": "archived"})
+        except HttpError as err:
+            if err.status != 404:
+                raise
+    if "retire" in ids:
+        ids.pop("retire")
+        save()
+
+    buy_url = checkout.get("purchase_url") or f"/checkout/{checkout['id']}"
+    if buy_url.startswith("/"):
+        buy_url = WHOP_HOSTS[mode][1] + buy_url
+    return product["id"], plan["id"], buy_url
 
 
-def stripe_webhook(key, conn, domain, mode):
-    """One webhook per Stripe mode (test/live) is enough for every product."""
-    if get_setting(conn, f"webhook_secret_{mode}"):
-        return "already set up"
-    endpoint = stripe(key, "POST", "/v1/webhook_endpoints", {
-        "url": f"https://{domain}/webhook",
-        "enabled_events[0]": "checkout.session.completed",
-        "enabled_events[1]": "checkout.session.async_payment_succeeded",
-        "description": "digital-product-kit",
+def whop_webhook(key, mode, domain):
+    """One webhook per Whop mode (sandbox/live) is enough for every product."""
+    with db() as conn:
+        if get_setting(conn, f"whop_webhook_secret_{mode}"):
+            return "already set up"
+    url = f"https://{domain}/webhook"
+    account_id = whop(key, mode, "GET", "/accounts/me")["id"]
+    # A webhook left from an earlier install signs with a secret this server no longer
+    # has. Its deliveries would all fail, so remove it before making the new one.
+    hooks = whop(key, mode, "GET", "/webhooks", query={"account_id": account_id, "first": 100})
+    for hook in hooks.get("data", []):
+        if hook.get("url") == url:
+            whop(key, mode, "DELETE", f"/webhooks/{hook['id']}")
+    hook = whop(key, mode, "POST", "/webhooks", {
+        "url": url,
+        "events": ["payment.succeeded"],
+        "api_version_date": WHOP_API_VERSION,
     })
-    set_setting(conn, f"webhook_secret_{mode}", endpoint["secret"])
-    return f"https://{domain}/webhook"
+    if not hook.get("webhook_secret"):
+        sys.exit("Whop made the webhook but didn't return its signing secret. "
+                 "Delete it in Whop (Dashboard > Developer > Webhooks) and run this again.")
+    with db() as conn:
+        set_setting(conn, f"whop_webhook_secret_{mode}", hook["webhook_secret"])
+    return url
+
+
+def explain_http_error(err, mode):
+    """Turns the most common API failures into a next step."""
+    msg = str(err)
+    if err.status in (401, 403) and "whop.com" in msg:
+        other = "without --sandbox" if mode == "sandbox" else "with --sandbox"
+        return (f"Whop didn't accept that key ({err.status}). Check you copied the whole key "
+                f"and gave it the Admin role. Sandbox and real keys look the same: if this "
+                f"is the other kind, run the command again {other}.\n\n{msg}")
+    return msg
 
 
 # ------------------------------------------------------------------ domain, DNS + email
@@ -148,7 +231,7 @@ def ensure_domain(args, domain, provider_name, dns):
     """Returns a line for the log. Buys the domain only with --buy and a yes."""
     if provider_name != "GoDaddy":
         if args.buy:
-            sys.exit("Buying a domain only works with GoDaddy. Set GODADDY_TOKEN in .env.")
+            sys.exit("Buying a domain only works with GoDaddy. Run again and paste a GoDaddy token.")
         return f"{domain} is in your Cloudflare account"
     if dns.owns():
         return f"{domain} is already yours"
@@ -331,7 +414,9 @@ def main():
     ap.add_argument("--seller", required=True, help="your name, shown on the page and emails")
     ap.add_argument("--description", default="", help="one or two lines for the sales page")
     ap.add_argument("--cover", help="cover image for the sales page")
-    ap.add_argument("--currency", default="usd")
+    ap.add_argument("--currency", default="usd", help="e.g. usd, eur, cop (default usd)")
+    ap.add_argument("--sandbox", action="store_true",
+                    help="use Whop's sandbox (test cards, no real money) with a sandbox key")
     ap.add_argument("--server-ip", help="defaults to this server's public IP")
     ap.add_argument("--buy", action="store_true",
                     help="buy the domain at GoDaddy if you don't own it yet")
@@ -343,21 +428,32 @@ def main():
     if not re.fullmatch(r"([a-z0-9-]+\.)+[a-z]{2,}", domain):
         sys.exit(f"That doesn't look like a domain: {args.domain} (example: houseplanthandbook.com)")
     slug = re.sub(r"[^a-z0-9]+", "-", args.name.lower()).strip("-")
-    cents = round(args.price * 100)
+    args.currency = args.currency.lower()
+    if args.price < 1:
+        sys.exit("Whop's lowest price is 1.00.")
+    mode = "sandbox" if args.sandbox else "live"
     webroot = f"/var/www/{domain}"
     for f in args.files + ([args.cover] if args.cover else []):
         if not Path(f).is_file():
             sys.exit(f"Not a file: {f}")
+    if args.sandbox:
+        with db() as conn:
+            live = conn.execute("SELECT 1 FROM products WHERE domain = ? AND mode = 'live'",
+                                (domain,)).fetchone()
+        if live:
+            sys.exit(f"{domain} already takes real payments. Running with --sandbox would put "
+                     f"a test checkout on your real page, where anyone could get the file with "
+                     f"a test card. Leave off --sandbox, or test on a different domain.")
 
     print(f"{BOLD}Setting up {args.name} on {domain}{RESET}")
     print(f"{DIM}Paste each key when asked (right-click or Ctrl+Shift+V). It stays hidden "
           f"and is never saved.{RESET}")
-    stripe_key = ask_key("STRIPE_SECRET_KEY", "Stripe secret key (sk_...)", ("sk_", "rk_"))
+    label = "Whop SANDBOX API key" if args.sandbox else "Whop API key (real payments)"
+    whop_key = ask_key("WHOP_API_KEY", label)
     resend_key = ask_key("RESEND_API_KEY", "Resend API key, full access (re_...)", ("re_",))
     godaddy = ask_key("GODADDY_TOKEN", "GoDaddy token (or press Enter to use Cloudflare)",
                       optional=True)
     cloudflare = "" if godaddy else ask_key("CLOUDFLARE_API_TOKEN", "Cloudflare token")
-    mode = "test" if "_test_" in stripe_key else "live"
 
     step("1. Domain")
     provider_name, dns = provider_for(domain, godaddy, cloudflare)
@@ -373,19 +469,21 @@ def main():
         names.append(Path(f).name)
         done(f"{Path(f).name} stored")
 
-    step("3. Stripe")
-    product_id, price_id, buy_url = stripe_product(stripe_key, args, slug, cents, domain)
+    step("3. Whop" + (" (sandbox)" if args.sandbox else ""))
+    product_id, price_id, buy_url = whop_product(whop_key, mode, args, slug, domain)
     done(f"product {product_id}")
     done(f"price {format_price(args.price, args.currency)} ({price_id})")
     done(f"checkout link {buy_url}")
+    done(f"webhook {whop_webhook(whop_key, mode, domain)}")
     with db() as conn:
-        done(f"webhook {stripe_webhook(stripe_key, conn, domain, mode)}")
+        # mode decides which Whop (sandbox or live) may unlock this product's files.
         conn.execute(
-            "INSERT INTO products (slug, title, domain, seller_name, price_id, files) "
-            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(slug) DO UPDATE SET title = excluded.title, "
-            "domain = excluded.domain, seller_name = excluded.seller_name, "
-            "price_id = excluded.price_id, files = excluded.files",
-            (slug, args.name, domain, args.seller, price_id, json.dumps(names)))
+            "INSERT INTO products (slug, title, domain, seller_name, price_id, files, mode) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(slug) DO UPDATE SET "
+            "title = excluded.title, domain = excluded.domain, "
+            "seller_name = excluded.seller_name, price_id = excluded.price_id, "
+            "files = excluded.files, mode = excluded.mode",
+            (slug, args.name, domain, args.seller, price_id, json.dumps(names), mode))
 
     step("4. DNS")
     ip = args.server_ip or http("GET", "https://api.ipify.org?format=json")["ip"]
@@ -422,7 +520,7 @@ def main():
         print(f"  {DIM}Resend is still checking the records. Orders will email once it "
               f"shows 'verified' at resend.com/domains.{RESET}")
 
-    note = "TEST mode, pay with 4242 4242 4242 4242" if mode == "test" else "LIVE"
+    note = "SANDBOX, pay with 4242 4242 4242 4242" if args.sandbox else "LIVE"
     print(f"\n{GREEN}{BOLD}Live: https://{domain}{RESET}  {DIM}({note}){RESET}")
     print(f"{DIM}Your keys were not saved on this server.{RESET}\n")
 
@@ -431,4 +529,4 @@ if __name__ == "__main__":
     try:
         main()
     except HttpError as err:
-        sys.exit(str(err))
+        sys.exit(explain_http_error(err, "sandbox" if "--sandbox" in sys.argv else "live"))
